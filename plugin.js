@@ -1,500 +1,419 @@
-// Kino plugin: Internet Archive (archive.org) — public-domain films and classic TV.
-// Declared hosts: archive.org and *.archive.org (downloads redirect to a storage node such as
-// dn720705.ca.archive.org).
+// FlixTrack 0.1.0 — Sincroniza películas y series con Trakt y SIMKL.
+// Capability "tracking": Kino avisa cuando terminas de ver algo y este
+// plugin lo registra en tu historial de Trakt y SIMKL, sin importar
+// desde qué fuente lo reproduzcas.
+//
+// Autenticación por flujo de dispositivo (RFC 8628, el de las TVs): el
+// botón "Conectar" de Ajustes muestra un código corto que apruebas desde
+// el teléfono o cualquier navegador, y el plugin canjea los tokens solo.
+// No hay client_secrets, ni códigos de 500 caracteres, ni expiraciones
+// de minutos: Trakt entrega tokens de 7 días con renovación de 3 meses,
+// y SIMKL tokens de 5 años.
 
-const BASE = "https://archive.org";
-const FIELDS = ["identifier", "title", "year", "description"];
-const VALID_ID = /^[A-Za-z0-9._-]{1,100}$/;
-const PLAYABLE_EXT = /\.(mp4|m4v|webm)$/i;
-const SUBTITLE_EXT = /\.(vtt|srt)$/i;
-// Preferred playable files, best first (archive.org's "format" field, lowercased).
-const FORMAT_RANK = ["h.264", "h.264 hd", "mpeg4", "512kb mpeg4"];
-const FILMS = "collection:(feature_films) AND mediatype:(movies)";
-const TV = "collection:(classic_tv) AND mediatype:(movies)";
-const CARTOONS = "collection:(animationandcartoons) AND mediatype:(movies)";
+const VERSION = "0.1.0";
+const UA = "FlixTrack/" + VERSION;
 
-// kino.log never breaks what it reports on: in Kino 0.9.43 release builds a call to it threw (an R8 rename),
-// which would turn one failed row or title into a failed Home or search.
-function log(...args) {
-  try {
-    kino.log(...args);
-  } catch {
-    // nothing to do: the log line is lost, the result is not
+// ---------- helpers ----------
+
+// Igual que en AniTrack: cuando el servidor rechaza, su respuesta viaja
+// en el mensaje de error (MAL nos enseñó que el cuerpo dice la verdad).
+async function fetchJson(url, options) {
+  const r = await kino.fetch(url, options);
+  if (!r.ok) {
+    let detalle = "http " + r.status;
+    try {
+      const cuerpo = await r.text();
+      if (cuerpo) detalle = detalle + " " + String(cuerpo).slice(0, 300);
+    } catch (e2) { /* sin cuerpo legible */ }
+    const e = new Error(detalle);
+    e.status = r.status;
+    throw e;
   }
-}
-
-function advancedUrl(query, rows, page = 1, sort = "downloads desc") {
-  const parts = ["q=" + encodeURIComponent(query)];
-  for (const f of FIELDS) parts.push("fl%5B%5D=" + f);
-  parts.push("sort%5B%5D=" + encodeURIComponent(sort), "rows=" + rows, "page=" + page, "output=json");
-  return BASE + "/advancedsearch.php?" + parts.join("&");
-}
-
-// Throws only AFTER its first await: in Kino a throw before a function's first await can't be
-// caught by its caller.
-async function getJson(url) {
-  const r = await kino.fetch(url);
-  if (!r.ok) throw new Error("archive.org respondió " + r.status);
   return r.json();
 }
 
-function first(v) {
-  return Array.isArray(v) ? v[0] : v;
-}
-
-function toItem(doc, kind) {
-  const description = [].concat(doc.description || []).join(" ").replace(/<[^>]*>/g, "").trim();
-  return {
-    id: doc.identifier,
-    ref: doc.identifier,
-    title: String(first(doc.title) || doc.identifier),
-    kind,
-    year: doc.year ? String(first(doc.year)) : undefined,
-    poster: BASE + "/services/img/" + encodeURIComponent(doc.identifier),
-    overview: description ? description.slice(0, 400) : undefined,
-  };
-}
-
-async function docs(query, rows, page = 1, sort) {
-  const data = await getJson(advancedUrl(query, rows, page, sort));
-  // A query archive.org can't parse still answers 200, with {"error": ...} instead of "response".
-  if (!data.response) throw new Error("archive.org no entendió la búsqueda");
-  return data.response.docs.filter((d) => VALID_ID.test(d.identifier));
-}
-
-// ---- The person's own addresses (Configurar: the "sources" list) ---------------------------------------
-const NEWEST = "addeddate desc";
-
-// One address: a collection or item (archive.org/details/<id>) or a search (archive.org/search?query=...).
-// Anything else, or another site, is left out: the plugin only ever talks to archive.org.
-function parseSource(raw) {
-  const text = String(raw || "").trim();
-  if (!text) return null;
-  let u;
+// Evita entregar dos veces el mismo evento (Kino reintenta; el id es la clave).
+function yaEntregado(id) {
   try {
-    u = new URL(text);
-  } catch {
-    return null;
-  }
-  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
-  if (u.hostname !== "archive.org" && !u.hostname.endsWith(".archive.org")) return null;
-  const details = /^\/details\/([^/?#]+)/.exec(u.pathname);
-  if (details) {
-    const id = decodeURIComponent(details[1]);
-    return VALID_ID.test(id) ? { kind: "details", id } : null;
-  }
-  if (u.pathname === "/search") {
-    const q = (u.searchParams.get("query") || u.searchParams.get("q") || "").trim();
-    if (q) return { kind: "search", query: q };
-  }
-  return null;
-}
-
-// Six url/cat slot pairs (url1, cat1 ... url6, cat6): plain settings every Kino since apiVersion 1 understands, so the
-// plugin installs on Kino versions without list settings (the `sources` list of 1.3.0-1.4.1 needed apiVersion 4).
-// Kino hands a plugin only the settings its manifest declares, so an old stored list never reaches this code.
-const SLOTS = 6;
-function sources() {
-  const out = [];
-  for (let i = 1; i <= SLOTS; i++) {
-    const s = parseSource(kino.config.get("url" + i));
-    // `id` is the archive.org identifier; `key` is this address's slot; `category` is the optional row name the person gave it.
-    if (s) out.push({ ...s, key: "src" + i, category: String(kino.config.get("cat" + i) || "").trim().slice(0, 60) });
-  }
-  return out;
-}
-
-// What a details address lists: the videos of a collection, or, when nothing is filed under it, that one item.
-// Asked once per address for as long as the runtime lives.
-const scopes = new Map();
-async function scopeInfo(source) {
-  if (source.kind === "search") return { query: "(" + source.query + ") AND mediatype:(movies)", item: false };
-  if (!scopes.has(source.key)) {
-    const collection = "collection:(" + source.id + ") AND mediatype:(movies)";
-    const inside = await docs(collection, 1);
-    scopes.set(source.key, inside.length ? { query: collection, item: false } : { query: "identifier:(" + source.id + ") AND mediatype:(movies)", item: true });
-  }
-  return scopes.get(source.key);
-}
-
-async function scopeOf(source) {
-  return (await scopeInfo(source)).query;
-}
-
-// An item address with several videos shows one card per video (a single video stays the item's one card). The card's id is
-// `<identifier>~<n>` (an id cannot hold `|`); its ref is `<identifier>|<file>`, which `resolve` already plays.
-const MAX_VIDEO_CARDS = 100;
-async function videoCards(identifier, doc) {
-  const meta = await metadata(identifier);
-  const originals = videoOriginals(meta.files);
-  if (originals.length < 2) return [];
-  const base = toItem(doc || { identifier, title: first(meta.metadata && meta.metadata.title) }, "movie");
-  return originals.slice(0, MAX_VIDEO_CARDS).map((f, i) => ({
-    ...base,
-    id: identifier + "~" + (i + 1),
-    ref: identifier + "|" + f.name,
-    title: (base.title + " · " + episodeTitle(f)).slice(0, 200),
-  }));
-}
-
-// The cards of a list of archive.org docs: the ones that are an item address with several videos are expanded.
-async function cardsOf(found, sourceList) {
-  const itemIds = new Set();
-  for (const s of sourceList) if (s.kind === "details" && (await scopeInfo(s)).item) itemIds.add(s.id);
-  const out = [];
-  for (const d of found) {
-    let parts = [];
-    if (itemIds.has(d.identifier)) {
-      try {
-        parts = await videoCards(d.identifier, d);
-      } catch (e) {
-        log("videos of", d.identifier, "failed", e.message);
-      }
-    }
-    if (parts.length) out.push(...parts);
-    else out.push(toItem(d, "movie"));
-  }
-  return out;
-}
-
-async function titleOf(source) {
-  if (source.kind === "search") return ("Búsqueda: " + source.query).slice(0, 80);
-  try {
-    const data = await getJson(BASE + "/metadata/" + encodeURIComponent(source.id) + "/metadata");
-    const title = first(data && data.result && data.result.title);
-    if (title) return String(title).slice(0, 80);
+    let seen = kino.storage.get("seen");
+    if (!Array.isArray(seen)) seen = [];
+    if (seen.indexOf(id) >= 0) return true;
+    seen.push(id);
+    while (seen.length > 50) seen.shift();
+    kino.storage.set("seen", seen, 2500000000);
   } catch (e) {
-    log("title failed", source.id, e.message);
+    kino.log("storage falló:", String(e));
+    return false;
   }
-  return source.id;
+  return false;
 }
 
-// The Home rows the addresses make: an address with a category joins the row of that category (same name, any capitals; the
-// row keeps the first spelling and is keyed by the first address's slot); an address without one is a row of its own.
-function ownRows() {
-  const out = [];
-  const byCategory = new Map();
-  for (const s of sources()) {
-    if (!s.category) {
-      out.push({ key: s.key, title: null, sources: [s] });
-      continue;
-    }
-    const name = s.category.toLowerCase();
-    if (!byCategory.has(name)) {
-      const row = { key: "cat" + s.key.slice(3), title: s.category, sources: [] };
-      byCategory.set(name, row);
-      out.push(row);
-    }
-    byCategory.get(name).sources.push(s);
-  }
-  return out;
+// El último resultado de cada servicio, para la línea de Conexión.
+function guardarEstado(servicio, texto) {
+  try { kino.storage.set(servicio + "Estado", texto, 2500000000); } catch (e) { /* cache */ }
 }
 
-// One archive.org query for a whole row (or for every address, in a search): its addresses' scopes, joined.
-async function queryOf(sourceList) {
-  const scopesOf = [];
-  for (const s of sourceList) scopesOf.push(await scopeOf(s));
-  return scopesOf.length === 1 ? scopesOf[0] : scopesOf.map((x) => "(" + x + ")").join(" OR ");
-}
+// ---------- Trakt ----------
 
-// Letters, digits and apostrophes inside words only: any other character can be query syntax to
-// advancedsearch (a stray "/", "-", "&" or "'" makes it answer {"error": ...}). So are the words
-// and/or/not in any case (a dangling one is an error too); dropping them never changes which
-// titles match. Word edges are spelled out with \p{} classes: \b is ASCII-only, so it would cut
-// the "or" out of "Señor".
-function cleanTitle(raw) {
-  return String(raw || "")
-    .replace(/[^\p{L}\p{M}\p{N}' ]+/gu, " ")
-    .replace(/(?<![\p{L}\p{M}\p{N}])'|'(?![\p{L}\p{M}\p{N}])/gu, " ")
-    .replace(/(?<![\p{L}\p{M}\p{N}])(and|or|not)(?![\p{L}\p{M}\p{N}])/giu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// Lowercase letters and digits only, accents folded: how a title and an identifier are compared.
-function squash(text) {
-  const lower = String(text || "").toLowerCase();
-  return (typeof lower.normalize === "function" ? lower.normalize("NFKD") : lower).replace(/[^a-z0-9]/g, "");
-}
-
-// How many forms of the title are asked of archive.org: what was typed, the original title and at
-// most two of Kino's other titles. Each form is two requests (films and TV), all sent at once, so a
-// search stays far under the 60 requests and 15 seconds of one call.
-const MAX_FORMS = 4;
-
-// The forms of the title archive.org is asked, best first, one per distinct text: `q`, then
-// `originalTitle`, then `altTitles`. Each is cut to its head (kino.rank.shortQuery: up to the first
-// ":", "," ...), because archive.org's title search wants every word, and a subtitle Kino's title
-// has ("Nosferatu, el vampiro") is rarely in archive.org's.
-function titleForms(query) {
-  const out = [];
-  const seen = new Set();
-  const given = [query.q, query.originalTitle].concat(Array.isArray(query.altTitles) ? query.altTitles : []);
-  for (const raw of given) {
-    if (out.length >= MAX_FORMS) break;
-    if (typeof raw !== "string" || !raw.trim()) continue;
-    const text = cleanTitle(kino.rank.shortQuery(raw));
-    const key = squash(text);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(text);
-  }
-  return out;
-}
-
-// With the year known, what is from that year (give or take one) goes first, then what has no
-// year, then the rest. Only an order: archive.org's years are often an upload's, and a remake is
-// still a real answer. Stable, so archive.org's own order (most downloaded) stays among equals.
-function byYear(items, year) {
-  const wanted = Number(year) || 0;
-  if (!wanted) return items;
-  const place = (item) => {
-    const y = parseInt(item.year, 10);
-    if (!y) return 1;
-    return Math.abs(y - wanted) <= 1 ? 0 : 2;
+// Toda llamada a Trakt lleva versión y la llave de tu app (el client_id).
+function headersTrakt(token) {
+  const h = {
+    "Content-Type": "application/json",
+    "trakt-api-version": "2",
+    "trakt-api-key": String(kino.config.get("traktClientId") || "").trim()
   };
-  return items.map((item, i) => ({ item, i, p: place(item) })).sort((a, b) => a.p - b.p || a.i - b.i).map((x) => x.item);
+  if (token) h.Authorization = "Bearer " + token;
+  return h;
 }
 
-export async function search(query) {
-  const forms = titleForms(query);
-  if (!forms.length) return [];
-  const text = forms[0];
-  const titleQuery = (form) => "title:(" + form + ")";
-  const anyTitle = forms.length === 1 ? titleQuery(text) : "(" + forms.map(titleQuery).join(" OR ") + ")";
-  // Both collections are always searched: `type` is only a hint. Kino sends it from TMDB's movie/tv
-  // split, which does not line up with archive.org's (public-domain films and classic TV are mixed,
-  // and a title can be in both), so filtering by it lost real matches. It only decides which group
-  // comes first.
-  const groups = [
-    { kind: "movie", where: FILMS },
-    { kind: "series", where: TV },
-  ];
-  if (query.type === "series") groups.reverse();
-  const out = [];
-  const seen = new Set();
-  // What is inside the person's own addresses comes first, as archive.org lists it: the person chose
-  // those addresses, so nothing there is ranked away.
-  const mine = sources();
-  if (mine.length) {
+// El access token de Trakt vence en 7 días: con el refresh token se
+// renueva solo. El flujo de dispositivo no usa client_secret.
+async function tokenTrakt() {
+  await null;
+  const guardado = kino.storage.get("traktAccessToken");
+  if (guardado) return guardado;
+  const refreshToken = kino.storage.get("traktRefreshToken");
+  if (!refreshToken) {
+    const e = new Error("sin conectar");
+    e.status = "sin-conectar";
+    throw e;
+  }
+  const r = await fetchJson("https://api.trakt.tv/oauth/token", {
+    method: "POST",
+    headers: headersTrakt(),
+    body: { json: {
+      refresh_token: refreshToken,
+      client_id: String(kino.config.get("traktClientId") || "").trim(),
+      grant_type: "refresh_token",
+      redirect_uri: "urn:ietf:wg:oauth:2.0:oob"
+    } }
+  });
+  if (!r.access_token) throw new Error("Trakt no devolvió token");
+  try {
+    if (r.refresh_token) kino.storage.set("traktRefreshToken", r.refresh_token, 2500000000);
+    kino.storage.set("traktAccessToken", r.access_token,
+      Math.min(Math.max(Math.floor((r.expires_in || 604800) * 1000 / 2), 3600000), 2500000000));
+  } catch (e2) { /* cache llena */ }
+  return r.access_token;
+}
+
+// El botón "Conectar Trakt" de Ajustes. Un toque entrega el código para
+// autorizar desde el teléfono; el siguiente toque canjea los tokens.
+// Con la cuenta ya conectada, comprueba la conexión con tu usuario real.
+async function conectarTrakt() {
+  await null;
+  const clientId = String(kino.config.get("traktClientId") || "").trim();
+  if (!clientId) {
+    return { message: "Falta el Client ID de Trakt: pégalo (de trakt.tv/oauth/applications) y guarda primero." };
+  }
+
+  // Ya conectado: probar con el usuario real.
+  if (kino.storage.get("traktRefreshToken")) {
     try {
-      const hits = (await docs(anyTitle + " AND (" + (await queryOf(mine)) + ")", 25)).filter((d) => !seen.has(d.identifier));
-      for (const card of await cardsOf(hits, mine)) {
-        if (seen.has(card.id)) continue;
-        seen.add(card.id);
-        out.push(card);
-      }
-      // An item address with several videos is also searched by its videos' own titles.
-      const wordLists = forms.map((f) => f.toLowerCase().split(" "));
-      for (const s of mine) {
-        if (s.kind !== "details" || !(await scopeInfo(s)).item) continue;
-        for (const card of await videoCards(s.id)) {
-          const title = card.title.toLowerCase();
-          if (seen.has(card.id) || !wordLists.some((words) => words.every((w) => title.includes(w)))) continue;
-          seen.add(card.id);
-          out.push(card);
-        }
+      const token = await tokenTrakt();
+      const r = await fetchJson("https://api.trakt.tv/users/settings", { headers: headersTrakt(token) });
+      return { message: "✓ Conectado a Trakt como: " + ((r.user && r.user.name) || "tu usuario") };
+    } catch (e) {
+      try { kino.storage.remove("traktAccessToken"); kino.storage.remove("traktRefreshToken"); } catch (e2) { }
+      return { message: "La conexión no funcionó (" + String(e.status || e.message).slice(0, 70) + "). Toca de nuevo para empezar de cero." };
+    }
+  }
+
+  // Flujo en curso: preguntar si ya aprobaste.
+  const pendiente = kino.storage.get("traktDevice");
+  if (pendiente && pendiente.code) {
+    try {
+      const r = await fetchJson("https://api.trakt.tv/oauth/device/token", {
+        method: "POST",
+        headers: headersTrakt(),
+        body: { json: { code: pendiente.code, client_id: clientId } }
+      });
+      if (r.access_token) {
+        try {
+          if (r.refresh_token) kino.storage.set("traktRefreshToken", r.refresh_token, 2500000000);
+          kino.storage.set("traktAccessToken", r.access_token,
+            Math.min(Math.max(Math.floor((r.expires_in || 604800) * 1000 / 2), 3600000), 2500000000));
+          kino.storage.remove("traktDevice");
+        } catch (e2) { /* cache */ }
+        guardarEstado("trakt", "ok");
+        return { message: "✓ Conectado a Trakt. Tu historial se sincroniza solo con cada película o episodio terminado." };
       }
     } catch (e) {
-      log("search in the person's addresses failed", e.message);
+      if (e.status === 400) {
+        return { message: "Aún pendiente: entra al link, escribe el código y autoriza en Trakt. Después vuelve a tocar este botón." };
+      }
+      try { kino.storage.remove("traktDevice"); } catch (e2) { }
     }
   }
-  // Every form in both collections, all at once. A form archive.org fails on is left out; only when
-  // every one fails does the search fail.
-  const asks = [];
-  for (const group of groups) {
-    for (const form of forms) {
-      asks.push(
-        (async () => {
-          try {
-            return { group, found: await docs(titleQuery(form) + " AND " + group.where, 25) };
-          } catch (e) {
-            return { group, error: e };
-          }
-        })()
-      );
-    }
+
+  // Empezar el flujo: pedir el código de dispositivo.
+  try {
+    const d = await fetchJson("https://api.trakt.tv/oauth/device/code", {
+      method: "POST",
+      headers: headersTrakt(),
+      body: { json: { client_id: clientId } }
+    });
+    if (!d.device_code) return { message: "Trakt no entregó código: revisa el Client ID." };
+    try { kino.storage.set("traktDevice", { code: d.device_code }, (d.expires_in || 600) * 1000); } catch (e2) { }
+    return { message: "1) Entra a " + (d.verification_url || "https://trakt.tv/activate") +
+      "   2) Escribe el código: " + (d.user_code || "?") +
+      "   3) Autoriza y vuelve a tocar este botón." };
+  } catch (e) {
+    return { message: "Trakt rechazó el Client ID: " + String(e.status || e.message).slice(0, 100) };
   }
-  const answers = await Promise.all(asks);
-  if (answers.every((a) => a.error)) throw answers[0].error;
-  const found = [];
-  for (const a of answers) {
-    if (a.error) {
-      log("search failed for one title", a.error.message);
-      continue;
-    }
-    for (const d of a.found) {
-      // An item can be in both collections, or be found by several forms: it is listed once, as the
-      // kind of the group that came first.
-      if (seen.has(d.identifier)) continue;
-      seen.add(d.identifier);
-      found.push(toItem(d, a.group.kind));
-    }
-  }
-  // Ranked against every title Kino knows for the work and every form asked: what shares most of
-  // their words first, a near-miss dropped. An item whose identifier is one of those titles exactly
-  // ("nosferatu" for "Nosferatu") always stays.
-  const titles = [query.q, query.originalTitle]
-    .concat(Array.isArray(query.altTitles) ? query.altTitles : [], forms)
-    .filter((t) => typeof t === "string" && t.trim());
-  const exact = new Set(titles.map(squash).filter(Boolean));
-  const relevant = new Set(kino.rank.filterRelevant(found, titles));
-  const kept = found.filter((item) => relevant.has(item) || exact.has(squash(item.id)));
-  return out.concat(kino.rank.sortBySimilarity(byYear(kept, query.year), titles));
 }
 
-// Home rows; each one's id is also its "Ver más" ref (the browse capability).
-const ROWS = [
-  { id: "films", title: "Películas de dominio público", query: FILMS, kind: "movie" },
-  { id: "tv", title: "Televisión clásica", query: TV, kind: "series" },
-  { id: "cartoons", title: "Animación clásica", query: CARTOONS, kind: "movie" },
-];
-const ROW_SIZE = 30;
-const PAGE_SIZE = 50;
+// Historial de Trakt. Un rechazo 401 renueva el token y reintenta una vez.
+async function enTrakt(payload) {
+  await null;
+  const enviar = async (token) => kino.fetch("https://api.trakt.tv/sync/history", {
+    method: "POST",
+    headers: headersTrakt(token),
+    body: { json: payload }
+  });
+  let r = await enviar(await tokenTrakt());
+  if (r.status === 401) {
+    kino.storage.remove("traktAccessToken");
+    r = await enviar(await tokenTrakt());
+  }
+  if (!r.ok) {
+    let detalle = "";
+    try { detalle = (r.text() || "").slice(0, 80); } catch (e2) { /* sin cuerpo */ }
+    const e = new Error("Trakt respondió " + r.status + " " + detalle);
+    e.status = "lista " + r.status + " " + detalle.slice(0, 40);
+    throw e;
+  }
+}
 
-export async function home() {
-  const out = [];
-  // The person's own addresses, newest first, before the plugin's own rows.
-  for (const row of ownRows()) {
+// ---------- SIMKL ----------
+
+// SIMKL pide tres parámetros en la URL de cada llamada más el User-Agent.
+function paramsSimkl() {
+  return "client_id=" + encodeURIComponent(String(kino.config.get("simklClientId") || "").trim()) +
+    "&app-name=flixtrack&app-version=" + VERSION;
+}
+
+// Los tokens de SIMKL (V2) duran años; si uno vence, el refresh lo renueva.
+async function tokenSimkl() {
+  await null;
+  const guardado = kino.storage.get("simklAccessToken");
+  if (guardado) return guardado;
+  const refreshToken = kino.storage.get("simklRefreshToken");
+  if (!refreshToken) {
+    const e = new Error("sin conectar");
+    e.status = "sin-conectar";
+    throw e;
+  }
+  const r = await fetchJson("https://api.simkl.com/oauth2/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": UA },
+    body: { form: {
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: String(kino.config.get("simklClientId") || "").trim()
+    } }
+  });
+  if (!r.access_token) throw new Error("SIMKL no devolvió token");
+  try {
+    if (r.refresh_token) kino.storage.set("simklRefreshToken", r.refresh_token, 2500000000);
+    kino.storage.set("simklAccessToken", r.access_token,
+      Math.min(Math.max(Math.floor((r.expires_in || 157680000) * 1000 / 2), 3600000), 2500000000));
+  } catch (e2) { /* cache llena */ }
+  return r.access_token;
+}
+
+// El botón "Conectar SIMKL": mismo flujo de dispositivo, con el alcance de
+// escritura (media:write) que exige la documentación para marcar vistos.
+async function conectarSimkl() {
+  await null;
+  const clientId = String(kino.config.get("simklClientId") || "").trim();
+  if (!clientId) {
+    return { message: "Falta el Client ID de SIMKL: crea una app (tipo TV/dispositivos) en simkl.com/settings/developer y pégala." };
+  }
+
+  if (kino.storage.get("simklRefreshToken")) {
     try {
-      const found = await docs(await queryOf(row.sources), ROW_SIZE, 1, NEWEST);
-      if (found.length) out.push({ id: row.key, title: row.title || (await titleOf(row.sources[0])), ref: row.key, items: await cardsOf(found, row.sources) });
+      const token = await tokenSimkl();
+      const r = await fetchJson("https://api.simkl.com/users/settings?" + paramsSimkl(), {
+        headers: { Authorization: "Bearer " + token, "User-Agent": UA }
+      });
+      const nombre = (r.user && (r.user.name || r.user.account)) || "tu usuario";
+      return { message: "✓ Conectado a SIMKL como: " + nombre };
     } catch (e) {
-      log("home row failed", row.key, e.message);
+      try { kino.storage.remove("simklAccessToken"); kino.storage.remove("simklRefreshToken"); } catch (e2) { }
+      return { message: "La conexión no funcionó (" + String(e.status || e.message).slice(0, 70) + "). Toca de nuevo para empezar de cero." };
     }
   }
-  for (const row of ROWS) {
+
+  const pendiente = kino.storage.get("simklDevice");
+  if (pendiente && pendiente.code) {
     try {
-      const found = await docs(row.query, ROW_SIZE);
-      out.push({ id: row.id, title: row.title, ref: row.id, items: found.map((d) => toItem(d, row.kind)) });
+      const r = await fetchJson("https://api.simkl.com/oauth2/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": UA },
+        body: { form: {
+          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+          device_code: pendiente.code,
+          client_id: clientId
+        } }
+      });
+      if (r.access_token) {
+        try {
+          if (r.refresh_token) kino.storage.set("simklRefreshToken", r.refresh_token, 2500000000);
+          kino.storage.set("simklAccessToken", r.access_token,
+            Math.min(Math.max(Math.floor((r.expires_in || 157680000) * 1000 / 2), 3600000), 2500000000));
+          kino.storage.remove("simklDevice");
+        } catch (e2) { /* cache */ }
+        guardarEstado("simkl", "ok");
+        return { message: "✓ Conectado a SIMKL. Tu historial se sincroniza solo con cada película o episodio terminado." };
+      }
     } catch (e) {
-      log("home row failed", row.id, e.message);
+      const texto = String(e.message || "");
+      if (e.status === 400 || e.status === 428) {
+        return { message: "Aún pendiente: abre el link de SIMKL, confirma el código y autoriza. Después vuelve a tocar este botón." };
+      }
+      if (texto.indexOf("invalid_client") >= 0) {
+        try { kino.storage.remove("simklDevice"); } catch (e2) { }
+        return { message: "Ese client_id no está habilitado para OAuth 2.0: tu app de SIMKL debe ser V2 (crea una nueva en simkl.com/settings/developer)." };
+      }
+      try { kino.storage.remove("simklDevice"); } catch (e2) { }
     }
   }
-  return out;
-}
 
-// "Ver más" on a Home row: the same query, a page at a time. The cursor is the next page number.
-export async function browse(ref, cursor) {
-  await null; // the checks below may throw: never before the first await
-  const own = ownRows().find((r) => r.key === ref);
-  const row = own || ROWS.find((r) => r.id === ref);
-  if (!row) throw kino.error("not_found", "esa fila ya no existe");
-  const page = cursor ? Number(cursor) : 1;
-  if (!Number.isInteger(page) || page < 1 || page > 100) throw kino.error("not_found", "página inválida");
-  const found = own ? await docs(await queryOf(own.sources), PAGE_SIZE, page, NEWEST) : await docs(row.query, PAGE_SIZE, page);
-  return { items: own ? await cardsOf(found, own.sources) : found.map((d) => toItem(d, row.kind)), next: found.length === PAGE_SIZE ? String(page + 1) : undefined };
-}
-
-async function metadata(id) {
-  const data = await getJson(BASE + "/metadata/" + encodeURIComponent(id));
-  if (!data || !Array.isArray(data.files)) throw new Error("archive.org no tiene ese item");
-  return data;
-}
-
-// "Season 2" after "Season 10" is wrong; compare digit runs as numbers.
-function natural(a, b) {
-  const x = a.split(/(\d+)/);
-  const y = b.split(/(\d+)/);
-  for (let i = 0; i < Math.min(x.length, y.length); i++) {
-    if (x[i] === y[i]) continue;
-    if (i % 2 === 1) return Number(x[i]) - Number(y[i]);
-    return x[i] < y[i] ? -1 : 1;
+  try {
+    const d = await fetchJson("https://api.simkl.com/oauth2/device", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": UA },
+      body: { form: { client_id: clientId, scope: "media:read media:write" } }
+    });
+    if (!d.device_code) return { message: "SIMKL no entregó código: revisa el Client ID." };
+    try { kino.storage.set("simklDevice", { code: d.device_code }, (d.expires_in || 900) * 1000); } catch (e2) { }
+    const url = d.verification_uri_complete || (d.verification_uri || "https://simkl.com/pin");
+    return { message: "1) Abre " + url +
+      "   2) Confirma el código: " + (d.user_code || "?") +
+      "   3) Autoriza y vuelve a tocar este botón." };
+  } catch (e) {
+    return { message: "SIMKL rechazó la solicitud: " + String(e.status || e.message).slice(0, 120) };
   }
-  return x.length - y.length;
 }
 
-// A video is an original file something playable exists for: itself (mp4/m4v/webm) or a derivative
-// made from it (its `original` field). The extension of the original tells nothing: real items
-// hold .avi, .mpg, .mkv and .divx originals next to their derived mp4.
-function videoOriginals(files) {
-  const playable = new Set();
-  for (const f of files) {
-    if (!PLAYABLE_EXT.test(f.name)) continue;
-    const from = f.source === "original" ? f.name : f.original;
-    if (from) playable.add(from);
+// Historial de SIMKL (V2): misma forma de payload que Trakt.
+async function enSimkl(payload) {
+  await null;
+  const enviar = async (token) => kino.fetch("https://api.simkl.com/sync/history?" + paramsSimkl(), {
+    method: "POST",
+    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json", "User-Agent": UA },
+    body: { json: payload }
+  });
+  let r = await enviar(await tokenSimkl());
+  if (r.status === 401) {
+    kino.storage.remove("simklAccessToken");
+    r = await enviar(await tokenSimkl());
   }
-  return files
-    .filter((f) => f.source === "original" && playable.has(f.name))
-    .sort((a, b) => natural(a.name, b.name));
+  if (!r.ok) {
+    let detalle = "";
+    try { detalle = (r.text() || "").slice(0, 80); } catch (e2) { /* sin cuerpo */ }
+    const e = new Error("SIMKL respondió " + r.status + " " + detalle);
+    e.status = "lista " + r.status + " " + detalle.slice(0, 40);
+    throw e;
+  }
 }
 
-function stem(name) {
-  return name.replace(/\.[^./]+$/, "");
-}
+// ---------- track (la capability "tracking") ----------
 
-function rank(f) {
-  const i = FORMAT_RANK.indexOf(String(f.format || "").toLowerCase());
-  return i === -1 ? FORMAT_RANK.length : i;
-}
-
-function bestPlayable(files, original) {
-  const family = files.filter((f) => (f.name === original.name || f.original === original.name) && PLAYABLE_EXT.test(f.name));
-  family.sort((a, b) => rank(a) - rank(b));
-  return family[0] || null;
-}
-
-function downloadUrl(id, name) {
-  return BASE + "/download/" + encodeURIComponent(id) + "/" + name.split("/").map(encodeURIComponent).join("/");
-}
-
-function subtitlesFor(id, files, original) {
-  const base = stem(original.name) + ".";
-  return files
-    .filter((f) => SUBTITLE_EXT.test(f.name) && f.name.startsWith(base))
-    .map((f) => ({
-      lang: /[._](es|spa|spanish)[._]/i.test(f.name) ? "es" : "en",
-      url: downloadUrl(id, f.name),
-      format: /\.srt$/i.test(f.name) ? "srt" : "vtt",
-    }));
-}
-
-function numbering(originals) {
-  const found = originals.map((f) => /S(\d{1,3})E(\d{1,4})/i.exec(f.name));
-  if (found.every((m) => m)) return found.map((m) => ({ season: Number(m[1]), number: Number(m[2]) }));
-  return originals.map((_, i) => ({ season: 1, number: i + 1 }));
-}
-
-function episodeTitle(f) {
-  if (f.title) return String(f.title);
-  const name = stem(f.name.split("/").pop());
-  const m = /S\d{1,3}E\d{1,4}\s*-\s*(.+)$/i.exec(name);
-  return m ? m[1] : name;
-}
-
-export async function episodes(ref) {
-  const meta = await metadata(ref);
-  const originals = videoOriginals(meta.files);
-  const numbers = numbering(originals);
-  return {
-    series: {
-      title: String(first(meta.metadata && meta.metadata.title) || ref),
-      poster: BASE + "/services/img/" + encodeURIComponent(ref),
-    },
-    episodes: originals.map((f, i) => ({
-      season: numbers[i].season,
-      number: numbers[i].number,
-      ref: ref + "|" + f.name,
-      title: episodeTitle(f),
-    })),
+// El evento de Kino → el payload que Trakt y SIMKL aceptan con la misma
+// forma: película → movies[]; episodio → shows[] con temporada y número.
+// Solo se usan los ids que Kino ya trae (imdb/tmdb/tvdb de TMDB); si no
+// hay ninguno reconocible, el evento se omite sin error.
+function payloadHistorial(event) {
+  const limpio = (ids) => {
+    const o = {};
+    if (ids.imdb) o.imdb = String(ids.imdb);
+    if (ids.tmdb) o.tmdb = Number(ids.tmdb);
+    if (ids.tvdb) o.tvdb = Number(ids.tvdb);
+    return o;
   };
+  if (event.kind === "movie") {
+    const ids = limpio(event.ids || {});
+    if (!ids.imdb && !ids.tmdb && !ids.tvdb) return null;
+    return { movies: [{ ids: ids }] };
+  }
+  const showIds = limpio((event.show && event.show.ids) || {});
+  if (!showIds.imdb && !showIds.tmdb && !showIds.tvdb) return null;
+  if (!event.season || !event.episode) return null;
+  return { shows: [{
+    ids: showIds,
+    seasons: [{ number: Number(event.season), episodes: [{ number: Number(event.episode) }] }]
+  }] };
 }
 
-export async function resolve(ref) {
-  const cut = ref.indexOf("|");
-  const id = cut === -1 ? ref : ref.slice(0, cut);
-  const wanted = cut === -1 ? null : ref.slice(cut + 1);
-  const meta = await metadata(id);
-  const originals = videoOriginals(meta.files);
-  const original = wanted ? originals.find((f) => f.name === wanted) : originals[0];
-  if (!original) throw new Error("este item no tiene video");
-  const file = bestPlayable(meta.files, original);
-  if (!file) throw new Error("no hay una versión que se pueda reproducir (mp4 o webm)");
-  const seconds = Number(file.length || original.length || 0);
-  return {
-    url: downloadUrl(id, file.name),
-    mime: /\.webm$/i.test(file.name) ? "video/webm" : "video/mp4",
-    subtitles: subtitlesFor(id, meta.files, original),
-    durationMs: seconds > 0 ? Math.round(seconds * 1000) : undefined,
-  };
+// Solo se actúa en "watched": el episodio o película terminado (se dispara
+// una sola vez, con 3 minutos o menos y al menos 90% visto). Cada servicio
+// va aislado en su propio try: si uno falla, el otro sigue, y la línea de
+// Conexión de Ajustes dice siempre el último resultado de cada uno.
+export async function track(event) {
+  await null;
+  if (event.type !== "watched") return { ok: true };
+  if (yaEntregado(event.id)) return { ok: true };
+
+  const payload = payloadHistorial(event);
+  if (!payload) {
+    kino.log("sin ids de imdb/tmdb/tvdb, omitido:", event.title || "");
+    return { ok: true };
+  }
+
+  if (String(kino.config.get("traktClientId") || "").trim() && kino.storage.get("traktRefreshToken")) {
+    try {
+      await enTrakt(payload);
+      guardarEstado("trakt", "ok");
+      kino.log("trakt: historial actualizado ✓");
+    } catch (e) {
+      const porque = String(e.status || e.code || e.message).slice(0, 60);
+      guardarEstado("trakt", "error " + porque);
+      kino.log("trakt falló:", porque);
+    }
+  }
+
+  if (String(kino.config.get("simklClientId") || "").trim() && kino.storage.get("simklRefreshToken")) {
+    try {
+      await enSimkl(payload);
+      guardarEstado("simkl", "ok");
+      kino.log("simkl: historial actualizado ✓");
+    } catch (e) {
+      const porque = String(e.status || e.code || e.message).slice(0, 60);
+      guardarEstado("simkl", "error " + porque);
+      kino.log("simkl falló:", porque);
+    }
+  }
+
+  return { ok: true };
+}
+
+// La línea "Conexión" de Ajustes: estado de cada servicio y, si falló el
+// último envío, el motivo exacto.
+export async function settingsStatus() {
+  await null;
+  let trakt = "Trakt —";
+  if (String(kino.config.get("traktClientId") || "").trim()) {
+    const estado = kino.storage.get("traktEstado");
+    if (estado && estado.indexOf("error") === 0) trakt = "Trakt ⚠ " + estado.slice(6, 45);
+    else if (kino.storage.get("traktRefreshToken")) trakt = "Trakt ✓";
+    else trakt = "Trakt · toca Conectar";
+  }
+  let simkl = "SIMKL —";
+  if (String(kino.config.get("simklClientId") || "").trim()) {
+    const estado = kino.storage.get("simklEstado");
+    if (estado && estado.indexOf("error") === 0) simkl = "SIMKL ⚠ " + estado.slice(6, 45);
+    else if (kino.storage.get("simklRefreshToken")) simkl = "SIMKL ✓";
+    else simkl = "SIMKL · toca Conectar";
+  }
+  return { estado: trakt + "  ·  " + simkl };
+}
+
+// Los botones de Ajustes: conectar (o probar) cada cuenta.
+export async function action(key) {
+  await null;
+  if (key === "conectarTrakt") return conectarTrakt();
+  if (key === "conectarSimkl") return conectarSimkl();
+  return null;
 }
