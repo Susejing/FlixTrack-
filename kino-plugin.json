@@ -9,9 +9,9 @@
   "capabilities": ["tracking"],
   "debug": true,
   "settings": [
-    { "key": "cuentas", "label": "Tus cuentas", "type": "section", "hint": "Pega solo el Client ID de cada servicio y toca su botón Conectar: aparecerá un código corto para autorizar desde tu teléfono. Kino te pedirá confirmar en rojo que este plugin puede ver lo que reproduces: es lo que permite marcar tu historial." },
+    { "key": "cuentas", "label": "Tus cuentas", "type": "section", "hint": "Pega cada Client ID y toca su botón Conectar: saldrá un código corto." },
     { "key": "estado", "label": "Conexión", "type": "status" },
-    { "key": "traktClientId", "label": "Client ID de Trakt", "type": "text", "hint": "De tu app en trakt.tv/oauth/applications (redirect URI: urn:ietf:wg:oauth:2.0:oob)" },
+    { "key": "traktClientId", "label": "Client ID de Trakt", "type": "text", "hint": "De trakt.tv/oauth/applications (redirect: urn:ietf:wg:oauth:2.0:oob)" },
     { "key": "conectarTrakt", "label": "Conectar Trakt", "type": "action" },
     { "key": "simklClientId", "label": "Client ID de SIMKL", "type": "text", "hint": "De tu app V2 en simkl.com/settings/developer (tipo TV/dispositivos)" },
     { "key": "conectarSimkl", "label": "Conectar SIMKL", "type": "action" }
