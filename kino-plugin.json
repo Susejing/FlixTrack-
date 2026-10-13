@@ -1,98 +1,19 @@
 {
-  "id": "archive-org",
-  "name": "Internet Archive",
-  "version": "1.4.2",
-  "apiVersion": 3,
+  "id": "flixtrack",
+  "name": "FlixTrack — Trakt y SIMKL",
+  "version": "0.1.0",
+  "apiVersion": 7,
   "entry": "plugin.js",
-  "description": "Películas de dominio público y televisión clásica de archive.org",
-  "author": "kinotvapp",
-  "homepage": "https://github.com/kinotvapp/kino-plugin-archive",
-  "hosts": [
-    "archive.org",
-    "*.archive.org"
-  ],
-  "capabilities": [
-    "search",
-    "home",
-    "browse",
-    "episodes",
-    "resolve",
-    "download"
-  ],
-  "color": "#E0A030",
-  "icon": "icon.png",
+  "description": "Registra las películas y episodios que terminas de ver en Kino directamente en tu historial de Trakt y SIMKL, sin importar la fuente. Conexión con un código corto desde el teléfono: nada de tokens kilométricos.",
+  "hosts": ["api.trakt.tv", "api.simkl.com"],
+  "capabilities": ["tracking"],
+  "debug": true,
   "settings": [
-    {
-      "key": "url1",
-      "label": "Dirección 1",
-      "type": "url",
-      "hint": "https://archive.org/details/… o una búsqueda"
-    },
-    {
-      "key": "cat1",
-      "label": "Categoría 1",
-      "type": "text",
-      "hint": "Opcional: nombre de la fila en el Home"
-    },
-    {
-      "key": "url2",
-      "label": "Dirección 2",
-      "type": "url",
-      "hint": "https://archive.org/details/… o una búsqueda"
-    },
-    {
-      "key": "cat2",
-      "label": "Categoría 2",
-      "type": "text",
-      "hint": "Opcional: nombre de la fila en el Home"
-    },
-    {
-      "key": "url3",
-      "label": "Dirección 3",
-      "type": "url",
-      "hint": "https://archive.org/details/… o una búsqueda"
-    },
-    {
-      "key": "cat3",
-      "label": "Categoría 3",
-      "type": "text",
-      "hint": "Opcional: nombre de la fila en el Home"
-    },
-    {
-      "key": "url4",
-      "label": "Dirección 4",
-      "type": "url",
-      "hint": "https://archive.org/details/… o una búsqueda"
-    },
-    {
-      "key": "cat4",
-      "label": "Categoría 4",
-      "type": "text",
-      "hint": "Opcional: nombre de la fila en el Home"
-    },
-    {
-      "key": "url5",
-      "label": "Dirección 5",
-      "type": "url",
-      "hint": "https://archive.org/details/… o una búsqueda"
-    },
-    {
-      "key": "cat5",
-      "label": "Categoría 5",
-      "type": "text",
-      "hint": "Opcional: nombre de la fila en el Home"
-    },
-    {
-      "key": "url6",
-      "label": "Dirección 6",
-      "type": "url",
-      "hint": "https://archive.org/details/… o una búsqueda"
-    },
-    {
-      "key": "cat6",
-      "label": "Categoría 6",
-      "type": "text",
-      "hint": "Opcional: nombre de la fila en el Home"
-    }
+    { "key": "cuentas", "label": "Tus cuentas", "type": "section", "hint": "Pega solo el Client ID de cada servicio y toca su botón Conectar: aparecerá un código corto para autorizar desde tu teléfono. Kino te pedirá confirmar en rojo que este plugin puede ver lo que reproduces: es lo que permite marcar tu historial." },
+    { "key": "estado", "label": "Conexión", "type": "status" },
+    { "key": "traktClientId", "label": "Client ID de Trakt", "type": "text", "hint": "De tu app en trakt.tv/oauth/applications (redirect URI: urn:ietf:wg:oauth:2.0:oob)" },
+    { "key": "conectarTrakt", "label": "Conectar Trakt", "type": "action" },
+    { "key": "simklClientId", "label": "Client ID de SIMKL", "type": "text", "hint": "De tu app V2 en simkl.com/settings/developer (tipo TV/dispositivos)" },
+    { "key": "conectarSimkl", "label": "Conectar SIMKL", "type": "action" }
   ]
 }
