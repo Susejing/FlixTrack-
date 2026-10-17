@@ -1,9 +1,11 @@
 {
   "id": "flixtrack",
   "name": "FlixTrack — Trakt y SIMKL",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "apiVersion": 7,
   "entry": "plugin.js",
+  "icon": "icon.png",
+  "color": "#F59E0B",
   "description": "Registra las películas y episodios que terminas de ver en Kino directamente en tu historial de Trakt y SIMKL, sin importar la fuente. Conexión con un código corto desde el teléfono: nada de tokens kilométricos.",
   "hosts": ["api.trakt.tv", "api.simkl.com"],
   "capabilities": ["tracking"],
